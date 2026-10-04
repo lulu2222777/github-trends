@@ -1,0 +1,19 @@
+node_modules/
+.shots/
+.probe/
+*.log
+*.db-wal
+*.db-shm
+
+# 中间产物：每次运行都会重新生成，且体积大（合计约 2 MB/天）。
+# 页面所需数据已由 build.mjs 内联进 dist/index.html，因此无需入库。
+# 必须入库的只有 data/trends.db（历史快照的载体）与 dist/index.html。
+data/repos.json
+data/ranking.json
+
+# 凭证：任何形似 token / secret 的文件都不许进版本库
+*token*
+*credential*
+*secret*
+.env
+.env.*

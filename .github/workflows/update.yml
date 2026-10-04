@@ -1,0 +1,68 @@
+name: 每日更新榜单
+
+on:
+  schedule:
+    # UTC 01:00 = 北京时间 09:00，每天早上一睁眼数据就是新的
+    - cron: '0 1 * * *'
+  workflow_dispatch:        # 也支持手动点一下立刻跑
+
+permissions:
+  contents: write           # 提交快照数据
+  pages: write
+  id-token: write
+
+concurrency:
+  group: daily-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # 需要 22.5+ 才有内置 node:sqlite
+
+      # 用仓库自带的 GITHUB_TOKEN，未认证时 Search 只有 10 次/分钟，认证后是 30 次/分钟
+      - name: 采集候选仓库
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run collect
+
+      - name: 写入快照
+        run: npm run store
+
+      - name: 评分与排名
+        run: npm run score
+
+      - name: 构建页面
+        run: npm run build
+
+      - name: 提交数据与页面
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data dist
+          if git diff --quiet --cached; then
+            echo "无变化，跳过提交"
+          else
+            git commit -m "chore: 更新 $(date -u +%F) 榜单数据"
+            git push
+          fi
+
+      - name: 上传页面产物
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: update
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
