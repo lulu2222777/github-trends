@@ -29,9 +29,24 @@ const OUTPUT = 'data/ranking.json';
 const PER_DIRECTION = 60;
 
 const WEIGHTS = { velocity: 0.42, relative: 0.23, quality: 0.20, freshness: 0.15 };
-const NOISE_PENALTY = 0.3;
+/**
+ * 噪音惩罚系数。
+ * 不宜过低（0.3 会让权威清单仓库照样挤进前 10），也不宜直接剔除
+ * （清单仓库本身有价值，只是不该占据「增长榜」）。
+ * 取 0.18：显著压到榜尾，但仍可在对照视图中被看到。
+ */
+const NOISE_PENALTY = 0.18;
 
 const DAY_MS = 86400_000;
+
+/** 目标增量窗口（天）：攒够这么久之后，口径固定为「严格近 7 天」 */
+const TARGET_WINDOW_DAYS = 7;
+/**
+ * 允许把窗口向前放宽的比例。
+ * 例：库里只有 5 天数据、目标是 7 天 → 放宽后仍按实际 5 天算，并如实标注。
+ * 这样既不会因为「差一点点」就用不上真实增量，也不会把半年前的起点算进来。
+ */
+const WINDOW_TOLERANCE = 0.6;
 
 /** 分位数归一化：把任意分布压到 0..1，天然抗长尾。相同值取平均位次。 */
 function percentileRanker(values) {
@@ -53,28 +68,87 @@ function percentileRanker(values) {
   };
 }
 
-/** 质量分原始值：0..0.9，衡量「这是个正经在维护的项目」而非空壳 */
+/**
+ * 从时间序列里取「起点快照」。
+ *
+ * 为什么不能直接用 snaps[0]：
+ *   采集层每轮都会重抓「近 7 天活跃 / 近 30 天新项目」的滚动窗口，
+ *   同一个仓库不同轮次的命中情况不一样。如果无脑拿最早那条快照当基准，
+ *   过几天之后增量就会变成「好几个月的累计」，而且不同仓库的统计跨度各不相同，
+ *   分数之间根本没法比较。
+ *
+ * 规则：
+ *   1) 快照跨度 >= 目标窗口（7 天）→ 取「距今 7 天内最早的一条」，口径固定、可比；
+ *   2) 快照跨度不足但 >= 目标窗口 × 容差 → 用实际最早那条，并标注真实跨度；
+ *   3) 跨度太短（例如刚攒到第 2 天）→ 仍用最早那条，但由调用方标记为「低置信」。
+ */
+function pickBaseline(snaps, latestTs) {
+  const firstTs = new Date(snaps[0].captured_at).getTime();
+  const spanDays = (latestTs - firstTs) / DAY_MS;
+
+  if (spanDays >= TARGET_WINDOW_DAYS) {
+    const cutoff = latestTs - TARGET_WINDOW_DAYS * DAY_MS;
+    // 取「不晚于 cutoff」的最后一条：跨度最接近 7 天且不超出
+    let chosen = snaps[0];
+    for (const s of snaps) {
+      if (new Date(s.captured_at).getTime() <= cutoff) chosen = s;
+      else break;
+    }
+    return {
+      snap: chosen,
+      spanDays: (latestTs - new Date(chosen.captured_at).getTime()) / DAY_MS,
+      windowDays: TARGET_WINDOW_DAYS,
+      lowConfidence: false,
+    };
+  }
+
+  const usable = spanDays >= TARGET_WINDOW_DAYS * WINDOW_TOLERANCE;
+  return {
+    snap: snaps[0],
+    spanDays,
+    windowDays: Number(spanDays.toFixed(2)),
+    lowConfidence: !usable,
+  };
+}
+
+/** 质量分原始值：连续计分，避免「阶梯加分 → 大量并列」 */
 function qualityRaw(repo, snap, now) {
   let q = 0;
-  if (repo.license) q += 0.15;
-  if ((repo.description ?? '').trim().length >= 20) q += 0.10;
 
+  // ① 规范程度 0.30 —— license / 描述 / topics / 主页
+  if (repo.license) q += 0.15;
+  const descLen = (repo.description ?? '').trim().length;
+  // 连续：描述越充实越加分，40 字以上封顶
+  q += Math.min(descLen / 40, 1) * 0.08;
   let topics = [];
   try { topics = JSON.parse(repo.topics || '[]'); } catch { topics = []; }
-  if (topics.length >= 3) q += 0.10;
-  if (repo.homepage) q += 0.05;
+  q += Math.min(topics.length / 6, 1) * 0.05;
+  if (repo.homepage) q += 0.02;
 
+  // ② 社区信号 0.25 —— fork 转化率（真正被人拿去用）与 issue 活跃度
   if (snap.stars > 0) {
-    q += Math.min((snap.forks / snap.stars) / 0.15, 1) * 0.10;
+    const forkRatio = snap.forks / snap.stars;
+    q += Math.min(forkRatio / 0.20, 1) * 0.18;
   }
-  if (snap.open_issues > 0) q += 0.05;
-  if ((repo.size_kb ?? 0) >= 100) q += 0.10;
+  if (snap.stars > 0) {
+    const issueRatio = snap.open_issues / snap.stars;
+    q += Math.min(issueRatio / 0.05, 1) * 0.07;
+  }
 
+  // ③ 维护热度 0.30 —— 距上次推送多久（连续衰减，而非 ≤30 天一刀切）
   if (snap.pushed_at) {
     const pushAge = (now - new Date(snap.pushed_at).getTime()) / DAY_MS;
-    if (pushAge <= 30) q += 0.20;
-    if (pushAge <= 7) q += 0.05;
+    if (pushAge <= 3) q += 0.30;
+    else if (pushAge <= 14) q += 0.30 - ((pushAge - 3) / 11) * 0.08;   // 0.30 → 0.22
+    else if (pushAge <= 90) q += 0.22 - ((pushAge - 14) / 76) * 0.12;  // 0.22 → 0.10
+    else if (pushAge <= 365) q += 0.10 - ((pushAge - 90) / 275) * 0.07; // 0.10 → 0.03
+    else q += 0.02;
   }
+
+  // ④ 工程体量 0.15 —— 对数尺度，几 KB 的玩具和几百 MB 的项目不该同级
+  const sizeKb = repo.size_kb ?? 0;
+  if (sizeKb > 0) q += Math.min(Math.log10(1 + sizeKb) / Math.log10(1 + 20000), 1) * 0.15;
+
   if (repo.archived) q -= 0.50;
   return Math.max(0, Math.min(1, q));
 }
@@ -107,6 +181,24 @@ function main() {
   const dataDays = dates.length;
   const mode = dataDays >= 2 ? 'growth' : 'bootstrap';
 
+  // 实际可用的增量窗口 = 各仓库起点到最新日期的中位数（避免个别新入库仓库把窗口拉偏）
+  const actualWindowDays = mode === 'growth'
+    ? (() => {
+        const latestTs = new Date(latestDate).getTime();
+        const spans = [];
+        for (const s of snapRows) {
+          if (s.captured_at === latestDate) continue;
+          spans.push((latestTs - new Date(s.captured_at).getTime()) / DAY_MS);
+        }
+        if (spans.length === 0) return 0;
+        // 取「7 天以内、最接近 7 天」的那批跨度作为代表值
+        const within = spans.filter((d) => d <= TARGET_WINDOW_DAYS);
+        const pool = within.length ? within : spans;
+        pool.sort((a, b) => a - b);
+        return Number(pool[pool.length - 1].toFixed(2));
+      })()
+    : 0;
+
   // 按仓库聚合成时间序列
   const series = new Map();
   for (const s of snapRows) {
@@ -135,19 +227,35 @@ function main() {
     if (repo.noise && !includeNoise) excluded.noise += 1;
 
     const first = snaps[0];
-    const spanDays = (new Date(latest.captured_at) - new Date(first.captured_at)) / DAY_MS;
+    const latestTs = new Date(latest.captured_at).getTime();
     const ageDays = Math.max((now - new Date(repo.created_at).getTime()) / DAY_MS, 1);
 
     let delta = 0;
     let velocity = 0;
     let relativeGrowth = 0;
+    let baselineAt = first.captured_at;
+    let spanDays = 0;
+    let windowDays = 0;
+    let lowConfidence = true;
 
-    if (spanDays >= 1) {
-      delta = latest.stars - first.stars;
-      velocity = delta / spanDays;
-      relativeGrowth = first.stars > 0 ? delta / first.stars : 0;
+    if (snaps.length >= 2) {
+      const base = pickBaseline(snaps, latestTs);
+      baselineAt = base.snap.captured_at;
+      spanDays = base.spanDays;
+      windowDays = base.windowDays;
+      lowConfidence = base.lowConfidence;
+
+      if (spanDays >= 1) {
+        delta = latest.stars - base.snap.stars;
+        velocity = delta / spanDays;
+        relativeGrowth = base.snap.stars > 0 ? delta / base.snap.stars : 0;
+      } else {
+        // 两天快照落在同一时间刻（理论上不会发生），退回历史平均速度
+        velocity = latest.stars / ageDays;
+        lowConfidence = true;
+      }
     } else {
-      // bootstrap：没有历史增量，退化为历史平均速度
+      // bootstrap：完全没有历史增量，退化为历史平均速度
       velocity = latest.stars / ageDays;
       relativeGrowth = 0;
     }
@@ -161,6 +269,9 @@ function main() {
       openIssues: latest.open_issues,
       ageDays,
       spanDays,
+      windowDays,
+      lowConfidence,
+      baselineAt,
       delta,
       velocity,
       relativeGrowth,
@@ -193,7 +304,10 @@ function serialize(e, rank, components = null, score = 0, isNoise = false) {
     pushedAt: e.snap.pushed_at,
     ageDays: Number(e.ageDays.toFixed(1)),
     delta: e.delta,
-    spanDays: e.spanDays,
+    spanDays: Number(e.spanDays.toFixed(2)),
+    windowDays: e.windowDays,
+    lowConfidence: Boolean(e.lowConfidence),
+    baselineAt: e.baselineAt,
     velocity: Number(e.velocity.toFixed(2)),
     relativeGrowth: Number((e.relativeGrowth * 100).toFixed(2)),
     quality: Number(e.quality.toFixed(3)),
@@ -266,6 +380,12 @@ function buildDirection(dir) {
     mode,
     dataDays,
     dates,
+    window: {
+      targetDays: TARGET_WINDOW_DAYS,
+      actualDays: mode === 'growth' ? actualWindowDays : null,
+      exact: mode === 'growth' && actualWindowDays >= TARGET_WINDOW_DAYS,
+      lowConfidence: mode === 'growth' && actualWindowDays < TARGET_WINDOW_DAYS * WINDOW_TOLERANCE,
+    },
     weights: WEIGHTS,
     noisePenalty: NOISE_PENALTY,
     excluded,

@@ -290,7 +290,7 @@ const DIMS = [
   { key:'freshness', label:'新鲜度', w:'0.15', color:'#3DD6C0' },
 ];
 
-const state = { dir:'all', sort:'score', compare:false, open:new Set() };
+const state = { dir:'all', sort:'score', compare:false, open:new Set(), touched:false };
 
 const nf = (n) => n.toLocaleString('en-US');
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
@@ -312,6 +312,14 @@ function sparkline(history, w, h) {
     + '</svg>';
 }
 
+/** 只有 1 个点时画一个圆点 —— 表示「曲线已就绪，等第 2 天数据」 */
+function dotOnly(w, h) {
+  return '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" style="display:block">'
+    + '<line x1="6" y1="' + (h / 2) + '" x2="' + (w - 6) + '" y2="' + (h / 2) + '" stroke="#FF7A45" stroke-width="1" stroke-dasharray="3 4" opacity=".4"/>'
+    + '<circle cx="' + (w - 8) + '" cy="' + (h / 2) + '" r="3.2" fill="#FF7A45"/>'
+    + '</svg>';
+}
+
 function renderStrip() {
   const t = DATA.directions.find((d) => d.id === 'all');
   document.getElementById('strip').innerHTML = [
@@ -323,13 +331,30 @@ function renderStrip() {
 }
 
 function renderNotice() {
+  const w = DATA.window || {};
   const boot = DATA.mode === 'bootstrap';
-  document.getElementById('noticeText').innerHTML = boot
-    ? '<b>当前为冷启动模式。</b>库里只有 ' + DATA.dataDays + ' 天快照，还无法计算真实的每日增量，'
-      + '榜单暂以「项目年龄内的平均涨速」排序。明天再跑一次采集入库后，会自动切换为真实的近 7 天增量，'
-      + '曲线与增量数字也会随之出现。'
-    : '<b>数据已进入增量模式。</b>基于 ' + DATA.dataDays + ' 天快照计算真实增长，'
-      + '榜单反映最近一段时间的实际升温速度。';
+
+  if (boot) {
+    document.getElementById('noticeText').innerHTML =
+      '<b>当前为冷启动模式。</b>库里只有 ' + DATA.dataDays + ' 天快照，还无法计算真实的每日增量，'
+      + '榜单暂以「项目年龄内的平均涨速」排序。明天自动跑完第二次后，就会切换为真实增量，'
+      + '曲线与增量数字也会随之出现。';
+    return;
+  }
+
+  if (w.lowConfidence) {
+    document.getElementById('noticeText').innerHTML =
+      '<b>数据已进入增量模式。</b>目前只有 ' + DATA.dataDays + ' 天快照，增量按实际 '
+      + w.actualDays + ' 天计算 —— 样本还很短，增速会被放大，仅供参考。'
+      + '再攒几天后口径会自动固定为「近 ' + w.targetDays + ' 天」。';
+    return;
+  }
+
+  document.getElementById('noticeText').innerHTML = w.exact
+    ? '<b>数据已进入增量模式。</b>基于 ' + DATA.dataDays + ' 天快照，统一按<b>近 '
+      + w.targetDays + ' 天</b>的真实 star 增量计算，各仓库口径一致、可比。'
+    : '<b>数据已进入增量模式。</b>基于 ' + DATA.dataDays + ' 天快照，增量按实际 '
+      + w.actualDays + ' 天计算（还不足 ' + w.targetDays + ' 天，口径已统一标注）。';
 }
 
 function renderTabs() {
@@ -367,11 +392,13 @@ function cardHTML(r) {
       + '<span class="vl">' + v.toFixed(2) + '</span></div>';
   }).join('');
 
-  const trend = (r.history && r.history.length >= 2)
-    ? '<div class="hd">star 趋势 · 近 ' + r.history.length + ' 次快照</div>' + sparkline(r.history, 220, 46)
-      + '<div class="snum" style="margin-top:6px">' + nf(r.history[0].stars) + ' → ' + nf(r.stars) + '</div>'
+  const hist = r.history || [];
+  const trend = hist.length >= 2
+    ? '<div class="hd">star 趋势 · ' + hist.length + ' 次快照 · 自 ' + esc(hist[0].date) + '</div>'
+      + sparkline(hist, 220, 46)
     : '<div class="hd">star 趋势</div>'
-      + '<div class="empty">曲线需要至少 2 天快照<br>已有 ' + DATA.dataDays + ' 天 · 明天自动出现</div>';
+      + '<div class="hd" style="margin-bottom:2px">已有 ' + hist.length + ' 次快照 · 次日自动出现曲线</div>'
+      + dotOnly(220, 46);
 
   const detail = isOpen
     ? '<div class="detail">'
@@ -402,8 +429,9 @@ function cardHTML(r) {
     + '<div class="right">'
       + '<div class="vel">+' + nf(Math.round(r.velocity)) + '<small>★ / 天</small></div>'
       + '<div class="rel">' + (DATA.mode === 'growth'
-          ? '实际涨幅 ' + (r.relativeGrowth >= 0 ? '+' : '') + r.relativeGrowth.toFixed(2) + '%'
-          : '相对涨幅需增量数据') + '</div>'
+          ? '近 ' + (r.windowDays || DATA.window.actualDays || DATA.window.targetDays) + ' 天'
+            + (r.delta >= 0 ? ' +' : ' ') + nf(r.delta) + ' ★'
+          : '累计 ' + nf(r.stars) + ' ★ · 历史均速') + '</div>'
       + '<div class="bar"><i style="width:' + Math.min(r.score * 100, 100).toFixed(1) + '%"></i></div>'
       + '<div class="snum">评分 <b>' + r.score.toFixed(3) + '</b> · 质量 ' + r.quality.toFixed(2) + '</div>'
     + '</div>'
@@ -424,15 +452,16 @@ function renderList() {
     ? items.map(cardHTML).join('')
     : '<li class="card" style="grid-template-columns:1fr;color:var(--text-3)">该方向暂无候选仓库</li>';
 
-  el.querySelectorAll('[data-open]').forEach((b) => {
-    b.onclick = () => {
-      const id = Number(b.dataset.open);
-      if (state.open.has(id)) state.open.delete(id); else state.open.add(id);
-      renderList();
-      const again = el.querySelector('[data-open="' + id + '"]');
-      if (again) again.scrollIntoView({ block: 'nearest' });
-    };
-  });
+el.querySelectorAll('[data-open]').forEach((b) => {
+  b.onclick = () => {
+    const id = Number(b.dataset.open);
+    if (state.open.has(id)) state.open.delete(id); else state.open.add(id);
+    state.touched = true;   // 用户主动操作过，之后重渲染不再自动展开
+    renderList();
+    const again = el.querySelector('[data-open="' + id + '"]');
+    if (again) again.scrollIntoView({ block: 'nearest' });
+  };
+});
 }
 
 function renderCompare() {
@@ -469,7 +498,6 @@ document.getElementById('cmpBtn').onclick = () => {
 document.getElementById('footTime').textContent =
   '生成于 ' + new Date(DATA.generatedAt).toLocaleString('zh-CN');
 
-state.open.add(DATA.directions.find((d) => d.id === 'all').top[0]?.id);
 renderStrip(); renderNotice(); renderTabs(); renderSorts(); renderList();
 </script>
 </body>

@@ -46,6 +46,8 @@ const IGNORE = [
   /\.db-wal$/,
   /\.db-shm$/,
   /\.log$/,
+  // 临时文件
+  /^\.tmp-/,
   // 安全兜底：任何形似凭证的文件都绝不允许进入公开仓库
   /token/i,
   /credential/i,

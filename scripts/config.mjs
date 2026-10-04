@@ -39,7 +39,13 @@ export const MAX_RETRY = 4;
 export const OUTPUT_JSON = 'data/repos.json';
 export const DB_FILE = 'data/trends.db';
 
-/** 明显低质的仓库特征，用于第一道降噪（黑名单字面匹配，命中即标记，不直接丢弃） */
+/**
+ * 降噪规则 —— 分四类，命中任意一类即标记为 noise。
+ *
+ * 设计原则：只标记不丢弃（评分层可以 --include-noise 查看），
+ * 但要把「名字看起来像正经项目、本质是清单/教程/资料堆」的仓库抓出来，
+ * 这类是榜单最大的污染源。
+ */
 export const NOISE_PATTERNS = [
   /awesome[-_]/i,
   /\bawesome\b/i,
@@ -55,4 +61,42 @@ export const NOISE_PATTERNS = [
   /\bdotfiles\b/i,
   /mirror/i,
   /\bnotes\b/i,
+  // 资料收集类 —— 只匹配「列表/合集」的明确表达。
+  // 不能用 collection / resources / guides 这类泛词，否则会误伤
+  // Inquirer.js、react-spectrum 这种描述里带 "a collection of libraries" 的正经开源库。
+  /\bcurated\b[^.]{0,40}\b(list|collection|guide)\b/i,
+  /\b(list|collection)\s+of\s+(the\s+)?(best|awesome|top|free|open[- ]source)\b/i,
+  /\blist\s*of\b/i,
+  /\bgreat[-_]?list/i,
+  /编程|面试|教程|指南|笔记|大全|入门|速查/i,
 ];
+
+/** 明显的「收集型」组织：它们名下的仓库几乎都是资料堆，不看名字直接标记 */
+export const NOISE_OWNERS = new Set([
+  'freecodecamp',
+  'public-apis',
+  'publicapis',
+  'ossu',
+  'codecrafters-io',
+  'practical-tutorials',
+  'kamranahmedse',
+  'donnemartin',
+  'mtdvio',
+  'vinta',
+  'jwasham',
+  'sindresorhus',   // awesome-* 的重度生产者，个人库里噪音密度极高
+]);
+
+/**
+ * 「巨无霸但已停止生长」特征：star 极高 + 很久没推送。
+ * 这类仓库在任何时间窗口里都排前面，但早已不再活跃。
+ */
+export const STALE_GIANT = {
+  minStars: 20000,
+  minIdleDays: 180,
+};
+
+/** 把仓库的文本特征拼成可匹配的串 */
+export function noiseHaystack(repo) {
+  return `${repo.fullName} ${repo.description ?? ''} ${(repo.topics ?? []).join(' ')}`;
+}

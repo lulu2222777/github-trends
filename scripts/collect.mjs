@@ -22,6 +22,9 @@ import {
   MAX_RETRY,
   OUTPUT_JSON,
   NOISE_PATTERNS,
+  NOISE_OWNERS,
+  STALE_GIANT,
+  noiseHaystack,
 } from './config.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -139,8 +142,27 @@ function normalize(item) {
 
 /** 打上降噪标记（只标记不丢弃，是否过滤留给评分层决定） */
 function markNoise(repo) {
-  const haystack = `${repo.fullName} ${repo.description}`;
-  const hits = NOISE_PATTERNS.filter((re) => re.test(haystack)).map((re) => re.source);
+  const hits = [];
+
+  // ① 文本特征
+  const haystack = noiseHaystack(repo);
+  for (const re of NOISE_PATTERNS) {
+    if (re.test(haystack)) hits.push(re.source);
+  }
+
+  // ② 收集型组织
+  if (repo.owner && NOISE_OWNERS.has(String(repo.owner).toLowerCase())) {
+    hits.push(`owner:${repo.owner}`);
+  }
+
+  // ③ 巨无霸但已停止生长
+  if (repo.stars >= STALE_GIANT.minStars && repo.pushedAt) {
+    const idleDays = (Date.now() - new Date(repo.pushedAt).getTime()) / 86400_000;
+    if (idleDays >= STALE_GIANT.minIdleDays) {
+      hits.push(`stale-giant(${Math.round(idleDays)}d)`);
+    }
+  }
+
   return { noise: hits.length > 0, noiseHits: hits };
 }
 

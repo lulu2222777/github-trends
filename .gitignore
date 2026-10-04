@@ -11,6 +11,9 @@ node_modules/
 data/repos.json
 data/ranking.json
 
+# 临时文件
+.tmp-*
+
 # 凭证：任何形似 token / secret 的文件都不许进版本库
 *token*
 *credential*
